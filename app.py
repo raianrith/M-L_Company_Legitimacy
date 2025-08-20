@@ -1,8 +1,5 @@
 import os
-import re
 import json
-import time
-import socket
 import tldextract
 import requests
 import streamlit as st
@@ -12,7 +9,6 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from duckduckgo_search import DDGS
 from openai import OpenAI
-
 
 # ---------------------------
 # Helpers
@@ -31,7 +27,6 @@ def normalize_url(url_or_domain: str):
     except Exception:
         return None
 
-
 def domain_from_any(s: str):
     if not s:
         return None
@@ -42,14 +37,12 @@ def domain_from_any(s: str):
         return None
     return ext.registered_domain.lower()
 
-
 def has_mx_records(domain: str) -> bool:
     try:
         answers = dns.resolver.resolve(domain, "MX")
         return len(answers) > 0
     except Exception:
         return False
-
 
 def whois_age_days(domain: str):
     try:
@@ -65,14 +58,8 @@ def whois_age_days(domain: str):
     except Exception:
         return None
 
-
 def http_probe(url: str, timeout=10):
-    out = {
-        "status_code": None,
-        "title": None,
-        "content_length": None,
-        "server": None
-    }
+    out = {"status_code": None, "title": None, "content_length": None, "server": None}
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
         out["status_code"] = r.status_code
@@ -86,22 +73,16 @@ def http_probe(url: str, timeout=10):
         pass
     return out
 
-
 def duckduckgo_snippets(query: str, max_results=6):
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
         clean = []
         for r in results:
-            clean.append({
-                "title": r.get("title"),
-                "href": r.get("href"),
-                "body": r.get("body")
-            })
+            clean.append({"title": r.get("title"), "href": r.get("href"), "body": r.get("body")})
         return clean
     except Exception:
         return []
-
 
 def build_feature_bundle(company_name, website, contact_name, contact_email, message):
     site_domain = domain_from_any(website or "")
@@ -136,71 +117,83 @@ def build_feature_bundle(company_name, website, contact_name, contact_email, mes
     }
     return features
 
-
+# --------- FIXED: use Chat Completions JSON mode (not Responses API) ----------
 def openai_verdict(features: dict, model: str):
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    """
+    Uses Chat Completions with response_format={'type':'json_object'}
+    to return a structured verdict compatible across more openai versions.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY env var is not set.")
 
-    schema = {
-        "name": "lead_verdict",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "trust_score": {"type": "number", "minimum": 0, "maximum": 100},
-                "label": {"type": "string", "enum": ["Likely Legit", "Unclear – Needs Manual Review", "Likely Spam/Fake"]},
-                "reasons": {"type": "array", "items": {"type": "string"}},
-                "recommended_actions": {"type": "array", "items": {"type": "string"}},
-                "key_signals": {
-                    "type": "object",
-                    "properties": {
-                        "domain_age_days": {"type": "integer", "nullable": True},
-                        "has_mx": {"type": "boolean", "nullable": True},
-                        "domain_mismatch": {"type": "boolean", "nullable": True},
-                        "http_title": {"type": "string", "nullable": True},
-                        "http_status_code": {"type": "integer", "nullable": True},
-                        "search_hits_count": {"type": "integer"}
-                    },
-                    "required": ["search_hits_count"]
-                }
-            },
-            "required": ["trust_score", "label", "reasons", "recommended_actions", "key_signals"],
-            "additionalProperties": False
-        }
-    }
+    client = OpenAI(api_key=api_key)
 
     system_msg = (
         "You are an anti-fraud analyst for B2B lead forms. "
         "Given OSINT features and search snippets, decide if the lead is legitimate. "
-        "Prefer conservative false-negative bias: if uncertain, mark 'Unclear – Needs Manual Review'."
+        "Prefer a conservative bias: if uncertain, label as 'Unclear – Needs Manual Review'. "
+        "STRICTLY return compact JSON matching this schema: "
+        "{"
+        "\"trust_score\": number (0-100), "
+        "\"label\": one of [\"Likely Legit\",\"Unclear – Needs Manual Review\",\"Likely Spam/Fake\"], "
+        "\"reasons\": [string,...], "
+        "\"recommended_actions\": [string,...], "
+        "\"key_signals\": {"
+        "\"domain_age_days\": number|null, "
+        "\"has_mx\": boolean|null, "
+        "\"domain_mismatch\": boolean|null, "
+        "\"http_title\": string|null, "
+        "\"http_status_code\": number|null, "
+        "\"search_hits_count\": number"
+        "}"
+        "}"
     )
 
     user_msg = (
-        "Return a JSON verdict following the provided schema. "
-        f"\n\nFeatures JSON:\n{json.dumps(features, ensure_ascii=False)}"
+        "Features JSON:\n"
+        f"{json.dumps(features, ensure_ascii=False)}\n\n"
+        "Return ONLY the JSON object, no extra text."
     )
 
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=model,
-        input=[{"role":"system","content":system_msg},
-               {"role":"user","content":user_msg}],
-        response_format={"type":"json_schema","json_schema":schema},
-        temperature=0.1
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.1,
+        response_format={"type": "json_object"},
     )
+
+    content = resp.choices[0].message.content
     try:
-        content = resp.output[0].content[0].text
         return json.loads(content)
     except Exception:
-        return None
-
+        # Fallback: wrap minimal object if parsing fails
+        return {
+            "trust_score": 50,
+            "label": "Unclear – Needs Manual Review",
+            "reasons": ["Model returned non-JSON or unparsable JSON."],
+            "recommended_actions": ["Manual review"],
+            "key_signals": {
+                "domain_age_days": features.get("domain_whois_age_days"),
+                "has_mx": features.get("email_mx_exists"),
+                "domain_mismatch": features.get("domain_mismatch"),
+                "http_title": features.get("http_title"),
+                "http_status_code": features.get("http_status_code"),
+                "search_hits_count": len(features.get("duckduckgo_results") or []),
+            },
+        }
 
 def badge_color(score):
     if score is None:
         return "#999999"
     if score >= 75:
-        return "#16a34a"
+        return "#16a34a"  # green
     if score >= 55:
-        return "#ca8a04"
-    return "#dc2626"
-
+        return "#ca8a04"  # amber
+    return "#dc2626"      # red
 
 # ---------------------------
 # Streamlit UI
@@ -212,6 +205,7 @@ st.caption("Screens lead form submissions with OSINT checks + OpenAI verdict.")
 
 with st.sidebar:
     model = st.selectbox("OpenAI model", ["gpt-4.1-mini","gpt-4o-mini","o4-mini","gpt-4.1"], index=0)
+    st.markdown("Set your `OPENAI_API_KEY` in Streamlit secrets or env vars.")
 
 col1, col2 = st.columns([1,1])
 with col1:
@@ -223,9 +217,7 @@ with col2:
     contact_email = st.text_input("Contact Email", placeholder="jane.smith@acme-thermal.com")
     message = st.text_area("Message (optional)", placeholder="We need an industrial oven...")
 
-submitted = st.button("Run Trust Check", type="primary")
-
-if submitted:
+if st.button("Run Trust Check", type="primary"):
     with st.spinner("Collecting OSINT signals…"):
         feats = build_feature_bundle(company_name, website, contact_name, contact_email, message)
 
@@ -233,10 +225,68 @@ if submitted:
     st.json(feats)
 
     with st.spinner("Asking OpenAI for a verdict…"):
-        verdict = openai_verdict(feats, model=model)
+        # Ensure search_hits_count is always present for the model
+        if "duckduckgo_results" in feats:
+            search_hits = len(feats.get("duckduckgo_results") or [])
+        else:
+            search_hits = 0
+
+        # Add a mirror field to help the model
+        feats_for_model = dict(feats)
+        feats_for_model.setdefault("search_hits_count", search_hits)
+
+        verdict = openai_verdict(feats_for_model, model=model)
 
     st.subheader("AI Verdict")
     if not verdict:
         st.error("Could not parse AI response. Check API key & model.")
     else:
-        st.json(verdict)
+        score = verdict.get("trust_score")
+        label = verdict.get("label") or "—"
+        reasons = verdict.get("reasons") or []
+        actions = verdict.get("recommended_actions") or []
+        key_signals = verdict.get("key_signals") or {}
+        color = badge_color(score)
+
+        st.markdown(
+            f"""
+<div style="border:1px solid #e5e7eb; border-radius:12px; padding:16px; display:flex; align-items:center; gap:16px;">
+  <div style="width:110px; text-align:center;">
+    <div style="font-size:14px; color:#6b7280; margin-bottom:6px;">Trust Score</div>
+    <div style="font-size:32px; font-weight:700;">{int(score) if isinstance(score,(int,float)) else '—'}</div>
+  </div>
+  <div style="flex:1;">
+    <span style="background:{color}22; color:{color}; padding:6px 10px; border-radius:999px; font-weight:600;">{label}</span>
+    <div style="margin-top:10px; color:#374151;">
+      Reasons:
+      <ul>
+        {''.join(f'<li>{r}</li>' for r in reasons[:6])}
+      </ul>
+    </div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+        c1, c2 = st.columns([1,1])
+        with c1:
+            st.markdown("**Recommended next actions**")
+            if actions:
+                st.markdown("\n".join([f"- {a}" for a in actions]))
+            else:
+                st.write("—")
+        with c2:
+            st.markdown("**Key signals**")
+            # Ensure search_hits_count present in key_signals for display
+            ksig = {
+                "domain_age_days": key_signals.get("domain_age_days", feats.get("domain_whois_age_days")),
+                "has_mx": key_signals.get("has_mx", feats.get("email_mx_exists")),
+                "domain_mismatch": key_signals.get("domain_mismatch", feats.get("domain_mismatch")),
+                "http_title": key_signals.get("http_title", feats.get("http_title")),
+                "http_status_code": key_signals.get("http_status_code", feats.get("http_status_code")),
+                "search_hits_count": key_signals.get("search_hits_count", len(feats.get("duckduckgo_results") or [])),
+            }
+            st.json(ksig)
+
+    st.caption("Note: This is a screening tool; uncertain cases are routed to Manual Review.")
