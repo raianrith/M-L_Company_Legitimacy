@@ -1,9 +1,9 @@
 streamlit>=1.32
 pandas>=2.1
-duckduckgo-search>=6.1.0
-python-whois>=0.9.3
-dnspython>=2.4.2
 tldextract>=5.1.2
 requests>=2.31.0
 beautifulsoup4>=4.12.2
+python-whois>=0.9.3
+dnspython>=2.4.2
+duckduckgo-search>=6.1.0
 openai>=1.30,<2.0
