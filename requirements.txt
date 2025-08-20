@@ -1,0 +1,8 @@
+streamlit
+duckduckgo-search
+python-whois
+dnspython
+tldextract
+requests
+beautifulsoup4
+openai==1.*
