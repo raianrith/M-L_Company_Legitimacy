@@ -77,7 +77,7 @@ def http_probe(url: str, timeout=10):
         pass
     return out
 
-def ddg_snippets(query: str, max_results=6):
+def ddg_snippets(query: str, max_results=8):
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
@@ -122,7 +122,7 @@ def build_feature_bundle(company_name, website, contact_name, contact_email, mes
     return features
 
 # =========================
-# OpenAI verdict
+# OpenAI verdict (Chat Completions JSON mode)
 # =========================
 def openai_verdict(features: dict, model: str, max_retries: int = 3):
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -133,7 +133,7 @@ def openai_verdict(features: dict, model: str, max_retries: int = 3):
 
     system_msg = (
         "You are an anti-fraud analyst for B2B lead forms. "
-        "Given OSINT features and web search snippets, decide if the lead is legitimate. "
+        "Given OSINT features (DNS/MX/WHOIS/HTTP) and web search snippets, decide if the lead is legitimate. "
         "Favor a conservative bias: if uncertain, label 'Unclear – Needs Manual Review'. "
         "Return ONLY compact JSON with this schema: "
         "{"
@@ -152,14 +152,15 @@ def openai_verdict(features: dict, model: str, max_retries: int = 3):
         "}"
     )
 
-    compact_features = dict(features)
-    sr = compact_features.get("search_results") or []
+    # Trim the search bodies so payload stays small & reliable
+    compact = dict(features)
+    sr = compact.get("search_results") or []
     for item in sr:
-        if item.get("body") and len(item["body"]) > 200:
-            item["body"] = item["body"][:200] + "…"
-    compact_features["search_results"] = sr[:8]
+        if item.get("body") and len(item["body"]) > 220:
+            item["body"] = item["body"][:220] + "…"
+    compact["search_results"] = sr[:8]
 
-    user_msg = f"Features JSON:\n{json.dumps(compact_features)}\n\nReturn ONLY JSON."
+    user_msg = f"Features JSON:\n{json.dumps(compact, ensure_ascii=False)}\n\nReturn ONLY JSON."
 
     for attempt in range(max_retries):
         try:
@@ -173,9 +174,10 @@ def openai_verdict(features: dict, model: str, max_retries: int = 3):
                 response_format={"type": "json_object"},
             )
             return json.loads(resp.choices[0].message.content)
-        except Exception as e:
+        except Exception:
             time.sleep(1.5 * (attempt + 1))
 
+    # Fallback object if things go sideways
     return {
         "trust_score": 50,
         "label": "Unclear – Needs Manual Review",
@@ -205,7 +207,7 @@ def badge_color(score):
 # =========================
 st.set_page_config(page_title="Lead Trust Screening (AI)", page_icon="✅", layout="wide")
 st.title("🔎 Lead Trust Screening — AI Pre-Qualification")
-st.caption("Uses DuckDuckGo (no key) + OSINT checks + OpenAI verdicts.")
+st.caption("OpenAI + DuckDuckGo only. Screen single leads or CSV batches; no extra API keys required.")
 
 with st.sidebar:
     model = st.selectbox(
@@ -213,42 +215,51 @@ with st.sidebar:
         ["gpt-4.1-mini", "gpt-4o-mini", "o4-mini", "gpt-4.1"],
         index=0
     )
-    st.info("Only need: `OPENAI_API_KEY`")
+    st.info("Set Streamlit secret: OPENAI_API_KEY")
 
-company_name = st.text_input("Company Name*", placeholder="Acme Thermal Systems")
-website = st.text_input("Company Website", placeholder="acme-thermal.com")
-contact_name = st.text_input("Contact Name", placeholder="Jane Smith")
-contact_email = st.text_input("Contact Email", placeholder="jane@acme-thermal.com")
-message = st.text_area("Message (optional)", placeholder="We need an industrial oven...")
+tab_single, tab_batch = st.tabs(["Single Lead", "Batch CSV"])
 
-if st.button("Run Trust Check", type="primary"):
-    with st.spinner("Collecting OSINT signals…"):
-        feats = build_feature_bundle(company_name, website, contact_name, contact_email, message)
+# -------------------------
+# Single Lead tab
+# -------------------------
+with tab_single:
+    col1, col2 = st.columns([1,1])
+    with col1:
+        company_name = st.text_input("Company Name*", placeholder="Acme Thermal Systems")
+        website = st.text_input("Company Website", placeholder="acme-thermal.com")
+        contact_name = st.text_input("Contact Name", placeholder="Jane Smith")
+    with col2:
+        contact_email = st.text_input("Contact Email", placeholder="jane.smith@acme-thermal.com")
+        message = st.text_area("Message (optional)", placeholder="We need an industrial oven...")
 
-    st.subheader("Signals")
-    with st.expander("View collected signals"):
-        st.json({k: v for k, v in feats.items() if k != "search_results"})
-        if feats.get("search_results"):
-            st.markdown("**Search results:**")
-            for r in feats["search_results"]:
-                st.markdown(f"- **{r.get('title') or '—'}** — {r.get('body') or ''}\n  {r.get('href') or ''}")
+    if st.button("Run Trust Check", type="primary"):
+        with st.spinner("Collecting OSINT signals…"):
+            feats = build_feature_bundle(company_name, website, contact_name, contact_email, message)
 
-    with st.spinner("Asking OpenAI for a verdict…"):
-        verdict = openai_verdict(feats, model=model)
+        st.subheader("Signals")
+        with st.expander("View collected signals"):
+            st.json({k: v for k, v in feats.items() if k != "search_results"})
+            if feats.get("search_results"):
+                st.markdown("**Search results:**")
+                for r in feats["search_results"]:
+                    st.markdown(f"- **{r.get('title') or '—'}** — {r.get('body') or ''}\n  {r.get('href') or ''}")
 
-    st.subheader("AI Verdict")
-    if not verdict:
-        st.error("Could not parse AI response.")
-    else:
-        score = verdict.get("trust_score")
-        label = verdict.get("label") or "—"
-        reasons = verdict.get("reasons") or []
-        actions = verdict.get("recommended_actions") or []
-        key_signals = verdict.get("key_signals") or {}
-        color = badge_color(score)
+        with st.spinner("Asking OpenAI for a verdict…"):
+            verdict = openai_verdict(feats, model=model)
 
-        st.markdown(
-            f"""
+        st.subheader("AI Verdict")
+        if not verdict:
+            st.error("Could not parse AI response.")
+        else:
+            score = verdict.get("trust_score")
+            label = verdict.get("label") or "—"
+            reasons = verdict.get("reasons") or []
+            actions = verdict.get("recommended_actions") or []
+            key_signals = verdict.get("key_signals") or {}
+            color = badge_color(score)
+
+            st.markdown(
+                f"""
 <div style="border:1px solid #e5e7eb; border-radius:12px; padding:16px; display:flex; align-items:center; gap:16px;">
   <div style="width:110px; text-align:center;">
     <div style="font-size:14px; color:#6b7280; margin-bottom:6px;">Trust Score</div>
@@ -265,9 +276,132 @@ if st.button("Run Trust Check", type="primary"):
   </div>
 </div>
 """,
-            unsafe_allow_html=True
-        )
-        st.markdown("**Recommended actions:**")
-        st.write(actions or "—")
-        st.markdown("**Key signals:**")
-        st.json(key_signals)
+                unsafe_allow_html=True
+            )
+
+            c1, c2 = st.columns([1,1])
+            with c1:
+                st.markdown("**Recommended next actions**")
+                if actions:
+                    st.markdown("\n".join([f"- {a}" for a in actions]))
+                else:
+                    st.write("—")
+            with c2:
+                st.markdown("**Key signals**")
+                st.json({
+                    "domain_age_days": key_signals.get("domain_age_days"),
+                    "has_mx": key_signals.get("has_mx"),
+                    "domain_mismatch": key_signals.get("domain_mismatch"),
+                    "http_title": key_signals.get("http_title"),
+                    "http_status_code": key_signals.get("http_status_code"),
+                    "search_hits_count": key_signals.get("search_hits_count"),
+                })
+
+# -------------------------
+# Batch CSV tab
+# -------------------------
+with tab_batch:
+    st.markdown("**Upload CSV** with columns (case-insensitive ok):")
+    st.code("company_name, website, contact_name, contact_email, message", language="text")
+
+    file = st.file_uploader("Choose a CSV file", type=["csv"])
+    if file is not None:
+        try:
+            df = pd.read_csv(file)
+        except Exception:
+            file.seek(0)
+            df = pd.read_csv(file, encoding_errors="ignore")
+
+        # Normalize expected column names (flexible, case-insensitive)
+        rename_map = {}
+        cols_lower = {c.lower(): c for c in df.columns}
+        expected = ["company_name", "website", "contact_name", "contact_email", "message"]
+        aliases = {
+            "company_name": ["company", "companyname", "org", "organization"],
+            "website": ["domain", "url", "site", "company_website"],
+            "contact_name": ["name", "fullname", "contact"],
+            "contact_email": ["email", "contactemail"],
+            "message": ["notes", "msg", "comment"]
+        }
+        for want in expected:
+            if want in cols_lower:
+                rename_map[cols_lower[want]] = want
+            else:
+                for a in aliases[want]:
+                    if a in cols_lower:
+                        rename_map[cols_lower[a]] = want
+                        break
+        df = df.rename(columns=rename_map)
+
+        st.write("Preview:")
+        st.dataframe(df.head(10))
+
+        run = st.button("Run Batch Screening", type="primary")
+        if run:
+            results = []
+            progress = st.progress(0)
+            status = st.empty()
+            total = len(df)
+
+            for i, row in df.iterrows():
+                company_name = row.get("company_name")
+                website = row.get("website")
+                contact_name = row.get("contact_name")
+                contact_email = row.get("contact_email")
+                message = row.get("message")
+
+                status.info(f"Processing {i+1}/{total}: {company_name or website or contact_email or 'lead'}")
+
+                try:
+                    feats = build_feature_bundle(company_name, website, contact_name, contact_email, message)
+                    verdict = openai_verdict(feats, model=model)
+                except Exception as e:
+                    verdict = {
+                        "trust_score": None,
+                        "label": "Error",
+                        "reasons": [str(e)[:180]],
+                        "recommended_actions": ["Retry later / check inputs"],
+                        "key_signals": {
+                            "domain_age_days": None,
+                            "has_mx": None,
+                            "domain_mismatch": None,
+                            "http_title": None,
+                            "http_status_code": None,
+                            "search_hits_count": None,
+                        },
+                    }
+
+                out_row = dict(row)
+                out_row["trust_score"] = verdict.get("trust_score")
+                out_row["label"] = verdict.get("label")
+                out_row["reasons"] = "; ".join(verdict.get("reasons") or [])
+                out_row["recommended_actions"] = "; ".join(verdict.get("recommended_actions") or [])
+                ks = verdict.get("key_signals") or {}
+                out_row["sig_domain_age_days"] = ks.get("domain_age_days")
+                out_row["sig_has_mx"] = ks.get("has_mx")
+                out_row["sig_domain_mismatch"] = ks.get("domain_mismatch")
+                out_row["sig_http_title"] = ks.get("http_title")
+                out_row["sig_http_status_code"] = ks.get("http_status_code")
+                out_row["sig_search_hits_count"] = ks.get("search_hits_count")
+
+                results.append(out_row)
+
+                time.sleep(0.25)  # gentle pacing
+                progress.progress((i + 1) / total)
+
+            status.success("Batch complete.")
+            out_df = pd.DataFrame(results)
+
+            st.subheader("Results")
+            st.dataframe(out_df)
+
+            csv_bytes = out_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV with verdicts",
+                data=csv_bytes,
+                file_name="lead_screening_results.csv",
+                mime="text/csv"
+            )
+
+# Footer
+st.caption("Note: Only uses OPENAI_API_KEY. DuckDuckGo provides lightweight web presence signals.")
